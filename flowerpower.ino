@@ -1,4 +1,3 @@
-#include <ArduinoMqttClient.h>
 #if defined(ARDUINO_SAMD_MKRWIFI1010) || defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_AVR_UNO_WIFI_REV2)
 #include <WiFiNINA.h>
 #elif defined(ARDUINO_SAMD_MKR1000)
@@ -13,24 +12,39 @@
 #include <WiFiS3.h>
 #endif
 
+#include <ArduinoHA.h>
+
+#define BROKER_ADDR IPAddress(192, 168, 1, 102)
+#define BROKER_USERNAME "mosquito"
+#define BROKER_PASSWORD "ys2yGT32kdgwy8"
+
+byte mac[] = { 0xC0, 0x4B, 0x30, 0x12, 0x06, 0x6C };
+
+
 #include "arduino_secrets.h"
 char ssid[] = SECRET_SSID;  // your network SSID (name)
 char pass[] = SECRET_PASS;  // your network password (use for WPA, or use as key for WEP)
 
 //pins
 const int totalSensors = 4;
-int sensorPinsDigital[totalSensors] = { 2, 3, 4, 5 };
-int sensorPinsAnalog[totalSensors] = { A0, A1, A2, A3 };
+const int sensorPinsDigital[totalSensors] = { 2, 3, 4, 5 };
+const int sensorPinsAnalog[totalSensors] = { A2, A3, A4, A5 };
+int sensorStateDigital[totalSensors];
+uint16_t sensorStateAnalog[totalSensors];
 
 WiFiClient wifiClient;
-MqttClient mqttClient(wifiClient);
+HADevice device(mac, sizeof(mac));
+HAMqtt mqtt(wifiClient, device);
 
-const char broker[] = "homeassistant.local";
-int port = 1883;
-const char topicDigital[] = "flowerpower/digital";
-const char topicAnalog[] = "flowerpower/analog";
+HASensor sensors[] = {
+  HASensor("moist1"),
+  HASensor("moist2"),
+  HASensor("moist3"),
+  HASensor("moist4")
+};
 
-const long interval = 1000;
+const long updateInterval = 1000;
+unsigned long lastUpdateAt = 0;
 unsigned long previousMillis = 0;
 
 void setup() {
@@ -49,75 +63,76 @@ void setup() {
   Serial.println(ssid);
   while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
     // failed, retry
-    Serial.print(".");
+    Serial.print("retrying...");
     delay(5000);
   }
 
-  IPAddress ip = WiFi.localIP();
-  Serial.print("You're connected to the network. IP:");
-  Serial.println(ip);
+  Serial.println("WiFi connected");
 
-  // Each client must have a unique client ID
-  mqttClient.setId("flowerpower");
+  mqtt.setDataPrefix("fp");
+
+  // set device details
+  device.setName("Flower Power");
+  device.setSoftwareVersion("0.0.1");
+  device.enableSharedAvailability();
+  device.enableLastWill();
+
+  // configure sensors
+  for (HASensor sensor : sensors) {
+    sensor.setIcon("mdi:water");
+    sensor.setDeviceClass("sensor");
+  }
+  // moistureSensor1.setIcon("mdi:water");
+  // moistureSensor1.setName("Moisture Sensor 1");
+  // moistureSensor1.setDeviceClass("sensor");
+
+  // moistureSensor2.setIcon("mdi:water");
+  // moistureSensor2.setName("Moisture Sensor 2");
+  // moistureSensor2.setDeviceClass("sensor");
+
+  // moistureSensor3.setIcon("mdi:water");
+  // moistureSensor3.setName("Moisture Sensor 3");
+  // moistureSensor3.setDeviceClass("sensor");
+
+  // moistureSensor4.setIcon("mdi:water");
+  // moistureSensor4.setName("Moisture Sensor 4");
+  // moistureSensor4.setDeviceClass("sensor");
 
   // You can provide a username and password for authentication
-  mqttClient.setUsernamePassword("mosquito", "ys2yGT32kdgwy8");
-
-  Serial.print("Attempting to connect to the MQTT broker: ");
-  Serial.println(broker);
-
-  if (!mqttClient.connect(broker, port)) {
-    Serial.print("MQTT connection failed! Error code = ");
-    Serial.println(mqttClient.connectError());
-
-    while (1)
-      ;
-  }
-
-  Serial.println("You're connected to the MQTT broker!");
-  Serial.println();
+  // mqttClient.setUsernamePassword("mosquito", "ys2yGT32kdgwy8");
+  mqtt.begin(BROKER_ADDR, BROKER_USERNAME, BROKER_PASSWORD);
 }
 
 void loop() {
-  // call poll() regularly to allow the library to send MQTT keep alives which
-  // avoids being disconnected by the broker
-  mqttClient.poll();
+  mqtt.loop();
 
-  int sensorStateDigital[totalSensors];
-  for (int d = 0; d < totalSensors; d++) {
-    sensorStateDigital[d] = digitalRead(sensorPinsDigital[d]);
-  }
+  if ((millis() - lastUpdateAt) > updateInterval) {
+    for (int i = 0; i < totalSensors; i++) {
 
-  int sensorStateAnalog[totalSensors];
-  for (int a = 0; a < totalSensors; a++) {
-    sensorStateAnalog[a] = analogRead(sensorPinsAnalog[a]);
-  }
-
-  // to avoid having delays in loop, we'll use the strategy from BlinkWithoutDelay
-  // see: File -> Examples -> 02.Digital -> BlinkWithoutDelay for more info
-  unsigned long currentMillis = millis();
-
-  if (currentMillis - previousMillis >= interval) {
-    // save the last time a message was sent
-    previousMillis = currentMillis;
-
-    // send message, the Print interface can be used to set the message contents
-    Serial.println("Sending digital topic...");
-    mqttClient.beginMessage(topicDigital);
-    for (int sensor : sensorStateDigital) {
-      mqttClient.print(sensor);
-      delay(1);
+      // for digital: 1 = out of the dirt, 0 = in dirt
+      // analog ranges: wet = 0-300, dry = 301 - 400, arid: 401+
+      sensorStateDigital[i] = digitalRead(sensorPinsDigital[i]);
+      sensorStateAnalog[i] = analogRead(sensorPinsAnalog[i]);
     }
-    mqttClient.endMessage();
 
-    Serial.println("Sending analog topic...");
-    mqttClient.beginMessage(topicAnalog);
-    for (int sensor : sensorStateAnalog) {
-      mqttClient.print(sensor);
-      delay(1);
+    for (int j = 0; j < totalSensors; j++) {
+      if (sensorStateDigital[j] == 0) {  // it is in dirt, is it wet?
+        if (sensorStateAnalog[j] < 300) {
+          // all good
+          sensors[j].setValue("moist");
+        } else if (sensorStateAnalog[j] > 300 && sensorStateAnalog[j] < 400) {
+          // check soil
+          sensors[j].setValue("ok");
+        } else {
+          // water now!
+          sensors[j].setValue("dry");
+        }
+      } else {  // not in dirt, send alert
+        sensors[j].setValue("alert");
+      }
     }
-    mqttClient.endMessage();
 
-    Serial.println();
+    // moistureSensor1.setValue("good");
+    lastUpdateAt = millis();
   }
 }
